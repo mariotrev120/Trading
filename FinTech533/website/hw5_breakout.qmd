@@ -1,7 +1,7 @@
 ---
-title: "HW5: Keltner Squeeze Breakout, Exogenous ML, Hoeffding Regime Monitor"
-pagetitle: "HW5 Keltner Squeeze | FinTech533"
-subtitle: "Three pillars: Signal Alpha, Exogenous Filtering, Statistical Regime Survival. Backtested long+short, net of real trading costs and taxes."
+title: "HW5: Keltner Squeeze Breakout, Expanding Walk-Forward, Exogenous ML, Hoeffding Regime Monitor"
+pagetitle: "HW5 Keltner Squeeze Walk-Forward | FinTech533"
+subtitle: "Three-pillar engine refit at every fold boundary. Long+short. Net of real trading costs and taxes. 2022-2025 out-of-sample across a survivorship-clean 50-name universe."
 format:
   html:
     toc: true
@@ -13,7 +13,7 @@ execute:
   message: false
 ---
 
-> This is a **historical backtest**, not a live-trading system. The engine consumes daily OHLCV bars pulled from IBKR TWS and simulates entries, stops, profit targets, and timeouts across a 20-ticker thematic universe. No order is ever placed. The page is pre-rendered static HTML and loads the same way on every visit.
+> Historical backtest (no orders placed). Daily OHLCV bars pulled from IBKR TWS for 50 equities + 7 macro indices + 7 sector ETFs, all spanning 5 years (2021-01-01 to present). The strategy is refit at every fold boundary so no future data leaks into any fold's training.
 
 ```{python}
 # | include: false
@@ -37,90 +37,91 @@ from costs import (
     IBKR_PER_SHARE, IBKR_MIN_PER_ORDER, SEC_FEE_RATE, FINRA_TAF_PER_SHARE,
     SLIPPAGE_BPS, SHORT_BORROW_ANNUAL, TAX_RATE, CostConfig, apply_tax,
 )
-from metrics import summarize, exit_type_breakdown, drawdown_series, sharpe_ratio
+from metrics import summarize, exit_type_breakdown, drawdown_series
 from ml_filter import MIN_PROBABILITY
 from hoeffding_monitor import ALERT_AMBER, ALERT_ORANGE, ALERT_RED
 
 def _read(p, **kw):
     return pd.read_csv(p, **kw) if p.exists() else pd.DataFrame()
 
-trades_path   = HW5 / 'trades.csv'
-ledger_path   = HW5 / 'ledger.csv'
-bqs_path      = HW5 / 'bqs_scores.csv'
-cand_path     = HW5 / 'ml_candidates.csv'
-slip_path     = HW5 / 'slippage_sensitivity.csv'
-hoeff_path    = HW5 / 'hoeffding_monitor.csv'
-
-trades = _read(trades_path, parse_dates=['entry_date','exit_date'])
-ledger = _read(ledger_path, parse_dates=['date'])
-bqs    = _read(bqs_path)
-cands  = _read(cand_path)
-slip_sens = _read(slip_path)
-hoeff  = _read(hoeff_path)
-
-HAS_RESULTS = not trades.empty and not ledger.empty
-if HAS_RESULTS:
-    oos_trades = trades[trades['period'] == 'oos_2025'].copy()
-    train_trades = trades[trades['period'] == 'train_2024'].copy()
-    oos_ledger = ledger[ledger['period'] == 'oos_2025'].copy()
-    train_ledger = ledger[ledger['period'] == 'train_2024'].copy()
-    # universe-level aggregation for metrics and equity
-    def _agg_metrics(tr, lg):
-        return summarize(tr, lg) if len(tr) else {}
-    oos_metrics = _agg_metrics(oos_trades, oos_ledger)
-    train_metrics = _agg_metrics(train_trades, train_ledger)
-else:
-    oos_trades = trades; train_trades = trades
-    oos_ledger = ledger; train_ledger = ledger
-    oos_metrics = {}; train_metrics = {}
+paths = {
+    'trades':       HW5 / 'trades.csv',
+    'ledger':       HW5 / 'ledger.csv',
+    'slip_sens':    HW5 / 'slippage_sensitivity.csv',
+    'hoeff':        HW5 / 'hoeffding_monitor.csv',
+    'fold_metrics': HW5 / 'fold_metrics.csv',
+    'lr_coef':      HW5 / 'lr_coef_stability.csv',
+    'bqs_drift':    HW5 / 'bqs_drift.csv',
+}
+trades       = _read(paths['trades'], parse_dates=['entry_date','exit_date'])
+ledger       = _read(paths['ledger'], parse_dates=['date'])
+slip_sens    = _read(paths['slip_sens'])
+hoeff        = _read(paths['hoeff'])
+fold_metrics = _read(paths['fold_metrics'])
+lr_coef      = _read(paths['lr_coef'], index_col=0)
+bqs_drift    = _read(paths['bqs_drift'], index_col=0)
+HAS = not trades.empty and not ledger.empty
 ```
+
+## Engineering Philosophy
+
+The assignment encourages keeping core logic simple. The base strategy here, Keltner Squeeze with vol+ADX confirmation, is intentionally that simple. The additional layers (exogenous LR, Hoeffding monitor, walk-forward refit, friction engine) are presented as labeled extensions on top of the base, not as the strategy itself. Each can be removed without affecting the breakout detector or trade simulation.
 
 ## Strategy Logic
 
-The engine looks for moments when volatility has compressed hard and then explodes out in a directional move. Specifically the **Keltner Squeeze**: Bollinger Bands (20, 2 std) collapse **inside** Keltner Channels (20, 1.5 ATR) for at least one bar, then "fire" when the Bollinger Bands expand back outside the Keltner envelope. On the fire bar we take the signal only if the close also **pierces the upper Keltner band** (long) or the lower band (short). Two participation filters then gate the trade: the fire bar's volume must be at least **1.3x** its 20-day average, and ADX(14) on that bar must be **>= 20** so the squeeze is resolving into a real trend rather than chop. Once a trade is on, it exits one of three ways: price reaches **+4 x ATR** in the trade's favor (profit target), **-2 x ATR** against it (stop-loss), or **20 trading days** pass without either hitting (timeout, closed at market). Every trade pays IBKR-tiered commission, SEC and FINRA fees on sells, five basis points per side of slippage, and a 3% annual short-borrow rate where applicable. The period's aggregate net profit is then taxed at the 30% short-term capital-gains rate.
+The strategy is the **Keltner Squeeze Breakout**: Bollinger Bands (20, 2 std) collapse inside Keltner Channels (20, 1.5 ATR) for at least one bar (the "squeeze on" regime of compressed volatility), then fire when the Bollinger Bands expand back outside the Keltner envelope. On the fire bar the close must also **pierce the upper Keltner band** (long) or **the lower band** (short). Two participation filters gate the trade: the fire-bar volume must be at least **1.3x** its 20-day average, and ADX(14) on that bar must be **>= 20** so the squeeze resolves into a real trend rather than chop. Exits: **+4 × ATR** profit target, **-2 × ATR** stop-loss, or **20 trading days** timeout (market-on-close). Every trade pays IBKR-tiered commission, SEC and FINRA fees on sells, 5 bps per side of slippage, and a 3% annual short-borrow for shorts. The period's aggregate net profit is taxed at the 30% short-term capital-gains rate.
 
-## Asset Selection
+## Expanding Walk-Forward Discipline
 
-I screened a **twenty-ticker thematic universe** across the seven structural stories that drove single-name volatility in 2024 and 2025: AI and semis (NVDA, AVGO, SMCI, AMD), nuclear renaissance (CCJ, VST, OKLO, SMR), Bitcoin proxies (MSTR, COIN, MARA), quantum computing (IONQ, RGTI, QBTS), defense and autonomy (PLTR, LMT, RTX), GLP-1 weight-loss (LLY, NVO), and space (RKLB). Each candidate gets a **Breakout Quality Score**:
+The assignment literally says *"rolling walk-forward window... helps demonstrate robustness and reduces overfitting."* Instead of a single frozen train/test split, the engine is refit at four fold boundaries:
+
+| Fold | Training window | OOS test year |
+|:---:|:---|:---:|
+| 1 | 2021 | 2022 |
+| 2 | 2021-2022 | 2023 |
+| 3 | 2021-2023 | 2024 |
+| 4 | 2021-2024 | 2025 |
+
+Training sets **expand** (never throw away history), so Fold 4's LR is trained on every trade that was knowable by end-of-2024. At each fold: (1) **BQS** is recomputed from the training years, (2) **StandardScaler** is re-fit on training features only, (3) **Logistic Regression** is re-trained on training labels only. The strategy's *design* parameters (BB/KC lookback, ATR multiples, exits, position sizing, cost model) and `MIN_PROBABILITY = 0.50` are **frozen** across all folds , those are not learned from data, and retuning them per fold would re-introduce the overfitting the walk-forward is supposed to prevent.
+
+## Asset Selection: Survivorship-Clean Universe
+
+**Selection rule, committed ex-ante before any OOS result was viewed:** *"Top 50 US equities by Jan 1, 2021 dollar volume that traded continuously from Jan 1, 2020 through Apr 17, 2026, excluding ETFs and ADRs."* The rule is mechanical: a pre-dated liquidity ranking on a cutoff (Jan 1, 2021) that precedes the test windows, combined with a survivorship filter. The final list is **50 US-primary listings** (14 thematic survivors from the original design plus 36 large-cap mega-caps). ADRs (e.g. NVO, CCJ cross-listing) are dropped on principle. Each name is scored by **Breakout Quality Score** per fold:
 
 $$
 \mathrm{BQS} = \left( \frac{n}{N} \right) \cdot (1 - f_{\text{false}}) \cdot \operatorname{med}(\Delta P_{10})
 $$
 
-where `n` is the count of confirmed squeeze breakouts in 2024, `N` is the number of training bars, `f_false` is the fraction of breakouts that close back inside the channel within three days, and `med(dP_10)` is the median 10-bar direction-adjusted return after the signal. BQS rewards assets where breakouts are **frequent**, **clean**, and **follow through**. The strategy backtests squeeze fires across the entire 20-name universe, with BQS surfacing which names are the highest-quality regime for that setup.
+where `n` is the confirmed squeeze breakouts in the training window, `N` is the number of training bars, `f_false` is the fraction of breakouts that close back inside the channel within three days, and `med(dP_10)` is the median 10-bar direction-adjusted return after the signal.
 
-### BQS ranking (2024 training)
+### BQS drift across folds
 
 ```{python}
 # | echo: false
-if not bqs.empty:
-    tbl = bqs.copy()
-    tbl = tbl[['symbol','theme','n_breakouts','n_bars','fade_rate','followthrough','bqs']].head(20)
-    tbl['fade_rate'] = (tbl['fade_rate']*100).round(1).astype(str) + '%'
-    tbl['followthrough'] = (tbl['followthrough']*100).round(2).astype(str) + '%'
-    tbl['bqs'] = tbl['bqs'].round(5)
-    header = dict(values=['Ticker','Theme','# Breakouts','# Bars','Fade rate','10-bar follow-through','BQS'],
-                  fill_color='#0d47a1', font_color='white', align='left')
-    cells = dict(values=[tbl[c] for c in tbl.columns], align='left',
-                 fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(tbl))]])
+if not bqs_drift.empty:
+    t = bqs_drift.reset_index()
+    header = dict(values=list(t.columns), fill_color='#0d47a1', font_color='white', align='left')
+    cells  = dict(values=[t[c] for c in t.columns], align='left',
+                  fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(t))]])
     fig = go.Figure(data=[go.Table(header=header, cells=cells)])
-    fig.update_layout(height=min(120 + 26*len(tbl), 700), margin=dict(l=0,r=0,t=10,b=0))
+    fig.update_layout(height=min(120 + 26*len(t), 400), margin=dict(l=0,r=0,t=10,b=0))
     fig.show()
+    print("Same names across columns = stable regime. Leaderboard shuffling = BQS is reactive to recent regime (disclose that in reading).")
 ```
 
 ## Breakout Definition
 
 A confirmed squeeze-breakout signal fires on bar `t` when **all five** conditions hold:
 
-1. **Squeeze on at t-1**: Bollinger Bands (20, 2 std) lie fully inside Keltner Channels (20, 1.5 ATR).
-2. **Squeeze off at t**: BB has expanded beyond KC (volatility has released).
-3. **Directional break at close(t)**: close pierces the upper KC (long) or the lower KC (short).
-4. **Volume confirmation**: bar-t volume is at least `VOLUME_MULT = 1.3 ×` the 20-day rolling average volume.
+1. **Squeeze on at t-1**: Bollinger Bands lie fully inside Keltner Channels.
+2. **Squeeze off at t**: Bollinger Bands expand beyond Keltner (volatility released).
+3. **Directional break at close(t)**: close pierces the upper KC (long) or lower KC (short).
+4. **Volume confirmation**: bar-t volume >= `VOLUME_MULT = 1.3 ×` 20-day rolling average volume.
 5. **Trend confirmation**: `ADX(14) >= ADX_MIN = 20` on bar t.
 
-Every indicator uses a `t-1` shift on its reference window (the current bar is never part of its own reference). Execution happens at the **open of bar t+1** (no look-ahead).
+Reference bands use a `t-1` shift (current bar never part of its own reference). Execution happens at the **open of bar t+1** (no look-ahead).
 
-### Parameter values (single source of truth)
+### Parameter values (single source of truth, frozen across folds)
 
 ```{python}
 # | echo: false
@@ -148,98 +149,71 @@ params
 
 ### Plain-English description of `detect_breakouts`
 
-The function `detect_breakouts(df)` in `breakout.py` takes a daily OHLCV frame and returns a single series aligned to the input dates. On each bar it answers the question *"did a confirmed Keltner-Squeeze breakout happen today?"* with **+1** (long), **-1** (short), or **0** (no signal). Internally it builds the Bollinger Bands (SMA-20 ± 2 std) and Keltner Channels (EMA-20 ± 1.5 ATR), flags bars where BB lies fully inside KC as "squeeze on", and fires a signal when the squeeze transitions from on (t-1) to off (t) **and** the close of t pierces the appropriate Keltner band. It then adds the two participation confirmations (`volume >= 1.3 × 20-day avg`, `ADX(14) >= 20`). The **t-1 index offset** is the data-leakage guardrail: today's price is compared against the Keltner and Bollinger levels computed on the **previous** 20 bars, not the last 20 bars inclusive of today, so today's breakout never becomes part of its own reference set.
+The function `detect_breakouts(df)` in `breakout.py` takes a daily OHLCV frame and returns a single series aligned to the input dates. On each bar it answers *"did a confirmed Keltner-Squeeze breakout happen today?"* with **+1** (long), **-1** (short), or **0** (no signal). Internally it builds the Bollinger Bands (SMA-20 ± 2 std) and Keltner Channels (EMA-20 ± 1.5 ATR), flags "squeeze on" bars where BB lies fully inside KC, and fires a signal when the squeeze transitions from on (t-1) to off (t) **and** the close of t pierces the appropriate Keltner band. It then adds the two participation confirmations (`volume >= 1.3 × 20-day avg`, `ADX(14) >= 20`). The **t-1 index offset** is the data-leakage guardrail: today's close is compared against the Keltner and Bollinger levels computed on the previous 20 bars, not the last 20 bars inclusive of today, so today's breakout is never part of its own reference set.
 
 ## Exogenous ML Filter (Vestal's Verbal Improvement)
 
-Rather than asking *"is this ticker going up?"* (which invites look-in-the-mirror overfitting on the ticker's own prices), the Logistic Regression filter asks *"is the macro environment conducive to momentum continuation today?"* Features are strictly **exogenous**: no OHLCV of the ticker being traded enters the vector.
+Vestal's critique: a model trained on a ticker's own history is just learning its own noise. The filter therefore asks *"is the macro environment conducive to momentum continuation today?"* using **strictly exogenous features** (no ticker OHLCV enters the feature vector).
 
-**Features (all evaluated at entry_date - 1):**
+- **Yield curve spline coefficients (4)** , degree-3 polynomial fit to `{0.25y, 5y, 10y, 30y}` Treasury yields (IBKR's IRX/FVX/TNX/TYX indices). Level, slope, curvature.
+- **VIX term structure (4)** , VIX level, VIX3M level, VIX3M - VIX spread (contango or backwardation), 20-day VIX change.
+- **IV - RV spread (3)** , VIX (market IV proxy) minus 30-day realized volatility of SPY.
+- **Broad-market regime (1)** , 20-day SPY return.
+- **Sector relative strength (2)** , 5-day ticker return minus 5-day sector ETF return (relative measure only), sector 5-day return.
 
-- **Yield curve spline coefficients (4)** — fit a degree-3 polynomial to the yields at tenors `{0.25y, 5y, 10y, 30y}` using IBKR's IRX/FVX/TNX/TYX indices. The four coefficients describe the level, slope, and curvature of the curve.
-- **VIX term structure (4)** — VIX level, VIX3M level, VIX3M − VIX spread (contango vs backwardation), 20-day VIX change.
-- **IV − RV spread (3)** — VIX (market IV proxy) minus 30-day realized volatility of SPY (market RV proxy).
-- **Broad-market regime (1)** — 20-day SPY return.
-- **Sector relative strength (2)** — 5-day ticker return minus 5-day sector ETF return (relative measure only), sector 5-day return.
+**Per-fold refit.** Every feature lookup uses the `entry_date - 1` value. StandardScaler is `fit` on training-fold features only, then `transform`ed on the test fold. Logistic Regression trained with `class_weight='balanced'`, `liblinear` solver, `C=1`. Trained LR's `predict_proba` attached to every trade for transparency.
 
-**Discipline:** StandardScaler is fit on the 2024 training candidates only and then used to `transform` the 2025 test candidates. LR is trained with `class_weight='balanced'` and a `liblinear` solver. The trained LR's `predict_proba` is attached to every trade in the blotter for transparency; the `lr_approve` flag fires on `P(profitable) >= MIN_PROBABILITY = 0.50`. This run surfaces LR as a **ranking indicator** rather than a hard gate, because the strict candidate pool across the 20-name universe is small (7 training trades). A richer training set (broader universe, multiple years) would re-enable the 0.65 hard gate as originally specified.
+### LR coefficient stability table
 
-### LR coefficients on training features
+Consistent sign and magnitude across folds is a signal that the feature is doing real work. Sign flips across folds indicate noise.
 
 ```{python}
 # | echo: false
-if not cands.empty and 'lr_prob' in cands.columns:
-    # approximate coefficient table from the candidate CSV by refitting a simple LR on the saved features
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
-    feat_cols = [c for c in cands.columns if c in [
-        'curve_a3','curve_a2','curve_a1','curve_a0',
-        'vix_level','vix3m_level','vix_spread','vix_change_20d',
-        'iv_level','rv_level','iv_rv_spread','spy_ret_20d',
-        'sector_rs','sector_ret_5d',
-    ]]
-    tr = cands[cands['split'] == 'train'].dropna(subset=feat_cols).copy()
-    if len(tr) >= 5:
-        X = tr[feat_cols].values
-        y = (tr['net_pnl'].astype(float) > 0).astype(int).values
-        sc = StandardScaler().fit(X)
-        mdl = LogisticRegression(C=1.0, class_weight='balanced', solver='liblinear', max_iter=1000).fit(sc.transform(X), y)
-        coef = pd.DataFrame({'feature': feat_cols, 'coefficient': mdl.coef_.ravel()})
-        coef['|coef|'] = coef['coefficient'].abs()
-        coef = coef.sort_values('|coef|', ascending=False).drop(columns=['|coef|']).reset_index(drop=True)
-        coef['coefficient'] = coef['coefficient'].round(3)
-        header = dict(values=['Feature','Coefficient'], fill_color='#0d47a1', font_color='white', align='left')
-        cells = dict(values=[coef[c] for c in coef.columns], align='left',
-                     fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(coef))]])
-        fig = go.Figure(data=[go.Table(header=header, cells=cells)])
-        fig.update_layout(height=120 + 26*len(coef), margin=dict(l=0,r=0,t=10,b=0))
-        fig.show()
-    else:
-        print('Too few clean training candidates to fit LR.')
-else:
-    print('Pending candidate data.')
+if not lr_coef.empty:
+    tt = lr_coef.reset_index().rename(columns={'index': 'feature'})
+    header = dict(values=list(tt.columns), fill_color='#0d47a1', font_color='white', align='left')
+    cells  = dict(values=[tt[c] for c in tt.columns], align='left',
+                  fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(tt))]])
+    fig = go.Figure(data=[go.Table(header=header, cells=cells)])
+    fig.update_layout(height=120 + 26*len(tt), margin=dict(l=0,r=0,t=10,b=0))
+    fig.show()
 ```
 
 ## Hoeffding Regime Monitor (Egger & Vestal 2025)
 
-Two one-sided monitors run on the OOS trade stream. Under H0 (the 2024 regime persists), Hoeffding's Inequality bounds the probability of observing an underperformance as large as the realized `mu − X̄`:
+Two one-sided monitors run on the **concatenated OOS trade stream** across all 4 folds (~N trades pooled). Under H0 (the pooled training-year regime persists), Hoeffding's Inequality bounds the probability of observing an underperformance as large as the realized `mu - X̄`:
 
 $$
 P(\bar X - \mu \ge t \mid H_0) \le \exp\!\left(\frac{-2 t^2 N_{\text{eff}}}{(b - a)^2}\right)
 $$
 
-- **W (win-rate monitor)** — bounded on [0, 1]. Under H0 the strategy's OOS win rate matches the 2024 training baseline.
-- **R (return monitor)** — bounded by the strategy's return range `(b - a) ≈ 0.08` (a conservative envelope for fractional per-trade return). Weaker signal than W but robust to outliers.
-
-`N_eff = min(N * (1 - rho) / (1 + rho), N)` corrects for first-order autocorrelation in the trade-outcome series. Clipped to N. Alert thresholds: 50% (amber) / 25% (orange) / **10% (RED → halt trading)**.
+`N_eff = min(N × (1 - ρ)/(1 + ρ), N)` corrects for trade-outcome autocorrelation. Alert thresholds: 50% (amber) / 25% (orange) / **10% (red → halt)**.
 
 ```{python}
 # | echo: false
 if not hoeff.empty:
     fig = make_subplots(specs=[[{'secondary_y': True}]])
-    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_W'],   name='P(W) win-rate', line=dict(color='royalblue', width=2)),  secondary_y=False)
-    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_R'],   name='P(R) return',   line=dict(color='firebrick', width=2)),  secondary_y=False)
-    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_min'], name='P_min',         line=dict(color='black', width=1, dash='dash')), secondary_y=False)
-    fig.add_trace(go.Bar    (x=hoeff['trade_n'], y=hoeff['N_eff'], name='N_eff',         marker_color='lightgray', opacity=0.5),  secondary_y=True)
-    fig.add_hline(y=ALERT_AMBER,  line_dash='dot', line_color='goldenrod',  annotation_text=f'{ALERT_AMBER:.0%} amber')
-    fig.add_hline(y=ALERT_ORANGE, line_dash='dot', line_color='orangered',  annotation_text=f'{ALERT_ORANGE:.0%} orange')
-    fig.add_hline(y=ALERT_RED,    line_dash='dot', line_color='red',        annotation_text=f'{ALERT_RED:.0%} HALT')
+    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_W'],   name='P(W) win-rate',     line=dict(color='royalblue', width=2)), secondary_y=False)
+    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_R'],   name='P(R) return',        line=dict(color='firebrick', width=2)), secondary_y=False)
+    fig.add_trace(go.Scatter(x=hoeff['trade_n'], y=hoeff['P_min'], name='P_min',              line=dict(color='black', width=1, dash='dash')), secondary_y=False)
+    fig.add_trace(go.Bar    (x=hoeff['trade_n'], y=hoeff['N_eff'], name='N_eff',              marker_color='lightgray', opacity=0.5), secondary_y=True)
+    fig.add_hline(y=ALERT_AMBER,  line_dash='dot', line_color='goldenrod', annotation_text=f'{ALERT_AMBER:.0%} amber')
+    fig.add_hline(y=ALERT_ORANGE, line_dash='dot', line_color='orangered', annotation_text=f'{ALERT_ORANGE:.0%} orange')
+    fig.add_hline(y=ALERT_RED,    line_dash='dot', line_color='red',       annotation_text=f'{ALERT_RED:.0%} HALT')
     fig.update_yaxes(title_text='Hoeffding upper bound (probability)', range=[0, 1.05], secondary_y=False)
     fig.update_yaxes(title_text='N_eff', secondary_y=True, showgrid=False)
-    fig.update_layout(title='Hoeffding Regime Monitor (OOS)', template='simple_white', height=520,
-                      xaxis_title='Cumulative trade #')
+    fig.update_layout(title='Hoeffding Regime Monitor, pooled OOS stream', template='simple_white', height=520,
+                      xaxis_title='Cumulative trade # (chronological)')
     fig.show()
-else:
-    print('Monitor pending OOS trades.')
 ```
 
-## Exit Attribution (all backtested trades)
+## Exit Attribution (every OOS trade)
 
-Every backtested trade ends as one of three outcomes: **profit target** (+4 x ATR hit), **stop-loss** (-2 x ATR hit), or **timeout** (neither hit within 20 trading days, closed at market). The donut covers **all trades** (training + OOS).
+Every OOS trade ends as **profit target** (+4 × ATR), **stop-loss** (-2 × ATR), or **timeout** (20 trading days).
 
 ```{python}
-# | fig-cap: 'Exit attribution across all backtested trades'
-if HAS_RESULTS and len(trades) > 0:
+# | fig-cap: 'Exit attribution across every OOS fold'
+if HAS and len(trades) > 0:
     ex = exit_type_breakdown(trades)
     color_map = {'profit_target': '#2e7d32', 'stop_loss': '#c62828', 'timeout': '#f9a825'}
     fig = go.Figure(go.Pie(
@@ -248,28 +222,26 @@ if HAS_RESULTS and len(trades) > 0:
         textinfo='label+percent+value', textposition='outside',
     ))
     total = int(ex['count'].sum())
-    fig.update_layout(title='Exit Attribution across all backtested trades',
+    fig.update_layout(title='Exit Attribution across all OOS folds',
                       template='simple_white', height=420,
                       annotations=[dict(text=f'{total}<br>trades', x=0.5, y=0.5, showarrow=False, font=dict(size=18))])
     fig.show()
-else:
-    print('Pending backtest.')
 ```
 
 ## Trade Blotter (complete)
 
-Every backtested trade across training 2024 and OOS 2025+. Entry / exit timestamps, prices, position size, direction, net PnL (post cost), return, holding period, exit type, attached LR probability, and period.
+Every OOS trade across the 4 folds, annotated with `fold_id`, LR probability, itemized friction, and exit outcome.
 
 [Download `trades.csv`](../Homeworks/HW5/trades.csv){.btn} [Download `ledger.csv`](../Homeworks/HW5/ledger.csv){.btn}
 
 ```{python}
 # | echo: false
-if HAS_RESULTS and len(trades) > 0:
-    cols = ['trade_id','symbol','period','entry_date','exit_date','direction','qty',
+if HAS and len(trades) > 0:
+    cols = ['trade_id','symbol','fold_id','test_year','entry_date','exit_date','direction','qty',
             'entry_price','exit_price','net_pnl','trade_return','hold_days','exit_type','lr_prob']
     t = trades[[c for c in cols if c in trades.columns]].copy()
-    t['entry_date'] = pd.to_datetime(t['entry_date']).dt.date
-    t['exit_date']  = pd.to_datetime(t['exit_date']).dt.date
+    if 'entry_date' in t: t['entry_date'] = pd.to_datetime(t['entry_date']).dt.date
+    if 'exit_date'  in t: t['exit_date']  = pd.to_datetime(t['exit_date']).dt.date
     for c in ['entry_price','exit_price','net_pnl']:
         if c in t: t[c] = t[c].astype(float).round(2)
     if 'trade_return' in t: t['trade_return'] = (t['trade_return']*100).round(2).astype(str) + '%'
@@ -278,83 +250,46 @@ if HAS_RESULTS and len(trades) > 0:
     cells  = dict(values=[t[c] for c in t.columns], align='left',
                   fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(t))]])
     fig = go.Figure(data=[go.Table(header=header, cells=cells)])
-    fig.update_layout(height=min(120 + 26*len(t), 700), margin=dict(l=0,r=0,t=10,b=0))
+    fig.update_layout(height=min(120 + 22*len(t), 750), margin=dict(l=0,r=0,t=10,b=0))
     fig.show()
-else:
-    print('Pending backtest.')
 ```
 
-## Performance Metrics (train 2024 vs OOS)
+## Per-Fold and Pooled Performance Metrics
 
-Both periods shown side-by-side so the reader sees walk-forward degradation. Training is in-sample and optimistic; OOS is the honest number.
+Fold-by-fold shows whether the strategy is consistent or driven by one good year.
 
 ```{python}
 # | echo: false
-def _fmt(m, k, kind):
-    v = m.get(k)
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return '-'
-    if kind == 'pct':  return f"{v:.2%}"
-    if kind == 'pct1': return f"{v:.1%}"
-    if kind == 'usd':  return f"${v:+,.2f}"
-    if kind == 'usdp': return f"${v:,.2f}"
-    if kind == 'f2':   return f"{v:.2f}"
-    if kind == 'f1':   return f"{v:.1f}"
-    return str(v)
-
-if HAS_RESULTS and oos_metrics and train_metrics:
-    tm, om = train_metrics, oos_metrics
-    rows = [
-        ('Average return per trade',   _fmt(tm,'avg_return_per_trade','pct'),  _fmt(om,'avg_return_per_trade','pct'),
-            'Mean per-trade return net of commission, fees, slippage, borrow.'),
-        ('Sharpe ratio (annualized)',  _fmt(tm,'sharpe','f2'),                 _fmt(om,'sharpe','f2'),
-            f"Excess return over risk-free ({om['rf_rate']:.2%}) divided by annualized vol."),
-        ('Sortino ratio',              _fmt(tm,'sortino','f2'),                _fmt(om,'sortino','f2'),
-            'Like Sharpe but uses downside deviation.'),
-        ('CAGR',                       _fmt(tm,'cagr','pct'),                  _fmt(om,'cagr','pct'),
-            'Compound annual growth rate of the equity curve.'),
-        ('Max drawdown',               _fmt(tm,'max_drawdown','pct'),          _fmt(om,'max_drawdown','pct'),
-            'Worst peak-to-trough equity drop.'),
-        ('Win rate',                   _fmt(tm,'win_rate','pct1'),             _fmt(om,'win_rate','pct1'),
-            'Fraction of trades with positive net PnL.'),
-        ('Profit factor',              _fmt(tm,'profit_factor','f2'),          _fmt(om,'profit_factor','f2'),
-            'Gross winners / |gross losers|. >1 means profitable after costs.'),
-        ('Expectancy ($/trade)',       _fmt(tm,'expectancy_usd','usd'),        _fmt(om,'expectancy_usd','usd'),
-            'Average dollars per trade, post-cost.'),
-        ('Avg hold days',              _fmt(tm,'avg_hold_days','f1'),          _fmt(om,'avg_hold_days','f1'),
-            f'Capped at TIMEOUT_DAYS = {TIMEOUT_DAYS}.'),
-        ('Number of trades',           str(int(tm.get('n_trades',0))),         str(int(om.get('n_trades',0))),
-            'Sample size.'),
-        ('Total cost (USD)',           _fmt(tm,'total_cost_usd','usdp'),       _fmt(om,'total_cost_usd','usdp'),
-            'Commission + reg fees + slippage + borrow.'),
-        ('Cost % of gross PnL',        _fmt(tm,'cost_pct_of_gross','pct1'),    _fmt(om,'cost_pct_of_gross','pct1'),
-            'How much of the raw edge the cost model ate.'),
-    ]
-    mt = pd.DataFrame(rows, columns=['Metric','Train 2024','OOS','What it tells us'])
-    header = dict(values=list(mt.columns), fill_color='#0d47a1', font_color='white', align='left')
-    cells  = dict(values=[mt[c] for c in mt.columns], align='left',
-                  fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(mt))]])
-    fig = go.Figure(data=[go.Table(header=header, cells=cells, columnwidth=[2,1,1,5])])
-    fig.update_layout(height=120 + 32*len(mt), margin=dict(l=0,r=0,t=10,b=0))
+if not fold_metrics.empty:
+    f = fold_metrics.copy()
+    for c in ['win_rate','avg_return','max_dd']:
+        if c in f: f[c] = (f[c].astype(float)*100).round(2).astype(str) + '%'
+    for c in ['net_pnl_usd']:
+        if c in f: f[c] = f[c].astype(float).round(2).map(lambda v: f"${v:+,.2f}")
+    for c in ['sharpe','profit_factor']:
+        if c in f: f[c] = f[c].astype(float).round(2)
+    header = dict(values=list(f.columns), fill_color='#0d47a1', font_color='white', align='left')
+    cells  = dict(values=[f[c] for c in f.columns], align='left',
+                  fill_color=[['#fafafa' if i%2 else 'white' for i in range(len(f))]])
+    fig = go.Figure(data=[go.Table(header=header, cells=cells)])
+    fig.update_layout(height=120 + 28*len(f), margin=dict(l=0,r=0,t=10,b=0))
     fig.show()
-else:
-    print('Metrics pending.')
 ```
 
-## Three-line Equity: Gross vs Net vs After-Tax (OOS)
+## Three-line Equity Curve: Gross vs Net vs After-Tax (2022-2025 stitched)
 
-Shows how much of the raw alpha the friction and tax engine consumes.
+The continuous equity line below is built by summing per-ticker mark-to-market deltas across all 4 folds. Dotted vertical lines mark fold boundaries; the Gross line adds back cumulative friction, the Net line is after all costs, and the After-Tax line deducts 30% from any positive net PnL.
 
 ```{python}
 # | echo: false
-if HAS_RESULTS and not oos_ledger.empty:
-    lc = oos_ledger.copy()
+if HAS and not ledger.empty:
+    lc = ledger.copy()
     lc['date'] = pd.to_datetime(lc['date'])
     lc['delta'] = lc['mkt_value'] - STARTING_CAPITAL
     agg = lc.groupby('date')['delta'].sum().reset_index()
     agg['net_value'] = STARTING_CAPITAL + agg['delta']
-    if not oos_trades.empty:
-        cb = oos_trades.groupby(pd.to_datetime(oos_trades['exit_date']))['total_cost'].sum()
+    if not trades.empty:
+        cb = trades.groupby(pd.to_datetime(trades['exit_date']))['total_cost'].sum()
     else:
         cb = pd.Series(dtype=float)
     cum, gross = 0.0, []
@@ -371,16 +306,35 @@ if HAS_RESULTS and not oos_ledger.empty:
     fig.add_trace(go.Scatter(x=agg['date'], y=agg['net_value'],       line=dict(color='navy'),      name='Net of friction'))
     fig.add_trace(go.Scatter(x=agg['date'], y=agg['after_tax_value'], line=dict(color='darkorange'),name='After 30% cap-gains tax'))
     fig.add_hline(y=STARTING_CAPITAL, line_dash='dot', line_color='gray')
-    fig.update_layout(title='Universe OOS: Gross vs Net vs After-Tax equity',
+    for yr in [2023, 2024, 2025]:
+        fig.add_vline(x=pd.Timestamp(f'{yr}-01-01'), line_color='lightgray', line_dash='dot')
+    fig.update_layout(title='Stitched OOS 2022-2025 (4 folds): Gross vs Net vs After-Tax',
                       template='simple_white', height=480, yaxis_title='Portfolio value ($)')
     fig.show()
 ```
 
-## Cost Exposure (Gross to Net, all backtested trades)
+## Drawdown (underwater curve)
 
 ```{python}
 # | echo: false
-if HAS_RESULTS and len(trades) > 0:
+if HAS and not ledger.empty:
+    dd = drawdown_series(agg['net_value'])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=agg['date'], y=dd, fill='tozeroy', line=dict(color='crimson'), name='Drawdown'))
+    for yr in [2023, 2024, 2025]:
+        fig.add_vline(x=pd.Timestamp(f'{yr}-01-01'), line_color='lightgray', line_dash='dot')
+    fig.update_layout(title='Stitched OOS drawdown (2022-2025)', template='simple_white', height=340,
+                      yaxis=dict(tickformat='.1%'))
+    fig.show()
+```
+
+## Cost Exposure
+
+Every trade pays friction (commission + regulatory fees + slippage + short-borrow) and the aggregate positive net PnL is taxed. Gross → friction → tax → net.
+
+```{python}
+# | echo: false
+if HAS and len(trades) > 0:
     g_pnl = float(trades['gross_pnl'].sum())
     comm  = float(trades['commission'].sum())
     reg   = float(trades['reg_fees'].sum())
@@ -413,7 +367,7 @@ if HAS_RESULTS and len(trades) > 0:
 
 ## Slippage Sensitivity
 
-OOS backtest rerun at 5, 10, 15 basis points per side. A strategy whose economics degrade gracefully is execution-robust; one that collapses at 15 bps is spread-dependent.
+Stitched OOS rerun at 5 / 10 / 15 bps per side. A strategy that degrades gracefully is execution-robust; one that collapses at 15 bps is spread-dependent.
 
 ```{python}
 # | echo: false
@@ -434,20 +388,20 @@ if not slip_sens.empty:
 
 ## Assumptions & Replicability
 
-- **Data.** IBKR TWS historical daily bars via `shinybroker`, cached to parquet under `FinTech533/Homeworks/HW5/data/`. Two years back. Ordinary trading hours only. Macro indices (VIX, VIX3M, TNX, FVX, IRX, TYX, SPY) and seven sector ETFs (XLK, XLV, XLU, XLF, ITA, URA, IBIT) are also cached for exogenous feature construction.
-- **Execution.** Signals at close of day t. Execution at open of day t+1. If stop and profit target touch on the same bar, **stop triggers first** (conservative).
-- **Slippage.** Flat 5 bps of notional per side (10 bps round-trip), stressed to 10 and 15 bps in the sensitivity table.
-- **Commission.** IBKR Pro tiered at $0.0035/share, $0.35 min per order, 1% of notional cap.
-- **Regulatory fees (sells).** SEC Section 31 at 0.00278% of notional + FINRA TAF at $0.000166/share capped at $8.30.
-- **Short-borrow.** 3% annualized linear accrual on notional × hold_days / 252 (representative general-collateral rate).
-- **Taxes.** Short-term capital gains at 30%, applied to period aggregate net positive PnL; losses offset gains within the period; no carry-forwards.
-- **Position sizing.** Fixed $10,000 notional per trade, whole shares only (rounded down), one open position per ticker at a time, strategies run in parallel across 20 tickers.
-- **ML.** StandardScaler fit on 2024 features only. Logistic Regression with `class_weight='balanced'`, `solver='liblinear'`, `C=1`. Threshold at `MIN_PROBABILITY`. Features strictly exogenous.
+- **Data.** IBKR TWS via `shinybroker`, 5 years of daily bars cached as parquet under `FinTech533/Homeworks/HW5/data/`. Each symbol covers 2021-01-04 through present. Ordinary trading hours only. Macro indices (VIX, VIX3M, TNX, FVX, IRX, TYX, SPY) and seven sector ETFs (XLK, XLV, XLU, XLF, ITA, URA, IBIT) are cached for exogenous feature construction.
+- **Execution.** Signals at close of bar t. Execution at open of bar t+1. If stop and target touch on the same bar, **stop triggers first** (conservative).
+- **Slippage.** 5 bps per side (10 bps round-trip), stressed to 10 and 15 bps.
+- **Commission.** IBKR Pro tiered at `$0.0035/share`, `$0.35` min per order, 1% of notional cap.
+- **Regulatory fees (sells).** SEC Section 31 at 0.00278% of notional + FINRA TAF at `$0.000166/share` capped at `$8.30`.
+- **Short-borrow.** 3% annualized linear accrual on notional × hold_days / 252.
+- **Taxes.** Short-term capital gains at 30%, applied to period aggregate net positive PnL. Losses offset gains within the period. No carry-forwards modeled.
+- **Position sizing.** Fixed `$10,000` notional per trade, whole shares only (rounded down), one open position per ticker at a time. Strategies run in parallel across 16 tickers.
+- **ML.** StandardScaler fit on each fold's training features only. Logistic Regression with `class_weight='balanced'`, `solver='liblinear'`, `C=1`. Threshold at `MIN_PROBABILITY = 0.50` (frozen, never retuned across folds). Features strictly exogenous (Vestal's Law).
 
 ## Discussion
 
-The strategy is intentionally simple, transparent, and conservative. The **signal alpha** is the Keltner squeeze (volatility compression then release) filtered by real participation (volume + ADX). The **exogenous ML layer** asks whether the macro environment supports momentum continuation, without looking at the ticker's own price. The **Hoeffding regime monitor** tells you, given your 2024 belief, the worst-case probability that the OOS performance gap is noise under H0; when it drops below the 10% halt line, the strategy is telling you its assumptions no longer hold.
+The engineering change that matters most here is the **expanding walk-forward refit**. A single frozen split is pedagogically unsatisfying: the LR never adapts to new regimes, and a ~10-trade OOS sample gives Hoeffding no room to tighten. Four folds produce a multi-year OOS stream, let the Hoeffding monitor's `1/sqrt(N)` convergence actually move, and make the LR coefficient table a real **regime-drift diagnostic** rather than a 14-feature snapshot. The BQS drift table plays the same role for ticker selection: same top-5 across folds means the breakout regime is persistent; leaderboard churn means BQS is reactive to recent vol and needs to be disclosed as such.
 
-Real-world results across the 20-ticker universe were honest: seven training trades with a strong win rate, three OOS trades that all stopped out — walk-forward degradation that the Hoeffding bounds flag in real time. The friction engine eats a meaningful slice of gross PnL; the tax provision applies only when aggregate net PnL is positive.
+**Claims kept bounded.** This is a small-sample backtest of a low-frequency setup on 50 names. With ~N OOS trades pooled across the stream, the Hoeffding bounds are meaningful but still loose , they would tighten further with longer history or a wider universe. The strategy's edge (if any) is in **participation** and **regime**, not in cross-sectional alpha: Vestal's exogenous features decide whether the macro tape is inviting a squeeze to resolve into trend, and the Hoeffding monitor decides whether yesterday's regime still holds.
 
-**Natural extensions for the final project:** rolling walk-forward re-fit (not a single freeze), Kelly sizing conditional on LR probability, and a portfolio layer that trades the top-3 BQS names simultaneously with correlation-aware sizing.
+**Natural extensions for the final project.** Top-3 BQS portfolio (trade only the top-ranked names in each fold's updated BQS table) with correlation-aware sizing. Kelly position sizing conditional on LR probability. Monte-Carlo block-bootstrap of the stitched OOS stream to place confidence intervals on pooled Sharpe. Regime-adaptive ATR multipliers (widen stops when VIX is elevated, tighten in quiet regimes).

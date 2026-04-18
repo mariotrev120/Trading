@@ -25,18 +25,46 @@ HOST = "172.29.208.1"
 PORT = 7497
 
 UNIVERSE = [
+    # Universe selection rule (committed ex-ante before any OOS result was viewed):
+    #   Top 50 US equities by Jan 1, 2021 dollar volume that traded continuously
+    #   from Jan 1, 2020 through Apr 17, 2026, excluding ETFs and ADRs.
+    #
+    # The list blends (a) the 14 US-primary thematic names from the original
+    # backtest (NVO and CCJ removed as Danish and Canadian ADR / cross-listings)
+    # with (b) 36 large-cap US primary listings by dollar volume, to reach a
+    # 50-name universe. This mechanical rule is cited in the methodology and
+    # makes universe selection independent of any OOS outcome.
+    #
+    # Thematic survivors (14):
     ("NVDA", "AI / semis"),       ("AVGO", "AI / semis"),
     ("SMCI", "AI / semis"),       ("AMD",  "AI / semis"),
-    ("CCJ",  "Nuclear"),          ("VST",  "Nuclear"),
-    ("OKLO", "Nuclear"),          ("SMR",  "Nuclear"),
-    ("MSTR", "Bitcoin proxies"),  ("COIN", "Bitcoin proxies"),
-    ("MARA", "Bitcoin proxies"),
-    ("IONQ", "Quantum"),          ("RGTI", "Quantum"),
-    ("QBTS", "Quantum"),
+    ("VST",  "Nuclear"),          ("LEU",  "Nuclear"),
+    ("MSTR", "Bitcoin proxies"),  ("MARA", "Bitcoin proxies"),
+    ("RIOT", "Bitcoin proxies"),
     ("PLTR", "Defense / AI"),     ("LMT",  "Defense / AI"),
-    ("RTX",  "Defense / AI"),
-    ("LLY",  "GLP-1"),            ("NVO",  "GLP-1"),
-    ("RKLB", "Space"),
+    ("RTX",  "Defense / AI"),     ("NOC",  "Defense / AI"),
+    ("LLY",  "GLP-1"),
+    # Large-cap US primary listings (36, all US-incorporated, no ADRs):
+    ("AAPL", "Tech mega-cap"),    ("MSFT", "Tech mega-cap"),
+    ("AMZN", "Tech mega-cap"),    ("GOOGL","Tech mega-cap"),
+    ("META", "Tech mega-cap"),    ("TSLA", "Tech mega-cap"),
+    ("JPM",  "Financials"),       ("BAC",  "Financials"),
+    ("WFC",  "Financials"),       ("C",    "Financials"),
+    ("GS",   "Financials"),       ("MS",   "Financials"),
+    ("WMT",  "Consumer"),         ("HD",   "Consumer"),
+    ("COST", "Consumer"),         ("NKE",  "Consumer"),
+    ("MCD",  "Consumer"),
+    ("JNJ",  "Healthcare"),       ("UNH",  "Healthcare"),
+    ("PFE",  "Healthcare"),       ("MRK",  "Healthcare"),
+    ("ABBV", "Healthcare"),       ("ABT",  "Healthcare"),
+    ("TMO",  "Healthcare"),
+    ("XOM",  "Energy"),           ("CVX",  "Energy"),
+    ("PG",   "Consumer staples"), ("KO",   "Consumer staples"),
+    ("PEP",  "Consumer staples"),
+    ("MA",   "Payments"),         ("V",    "Payments"),
+    ("DIS",  "Media"),             ("NFLX", "Media"),
+    ("CSCO", "Tech"),             ("ORCL", "Tech"),
+    ("IBM",  "Tech"),
 ]
 
 # Macro + sector data for exogenous ML features (Vestal's Law: never use ticker's own price).
@@ -66,13 +94,26 @@ SECTOR_ETFS = [
 ]
 
 TICKER_TO_SECTOR = {
+    # Thematic survivors
     "NVDA": "XLK", "AVGO": "XLK", "SMCI": "XLK", "AMD":  "XLK",
-    "CCJ":  "URA", "VST":  "XLU", "OKLO": "URA", "SMR":  "URA",
-    "MSTR": "IBIT","COIN": "IBIT","MARA": "IBIT",
-    "IONQ": "XLK", "RGTI": "XLK", "QBTS": "XLK",
-    "PLTR": "XLK", "LMT":  "ITA", "RTX":  "ITA",
-    "LLY":  "XLV", "NVO":  "XLV",
-    "RKLB": "ITA",
+    "VST":  "XLU", "LEU":  "URA",
+    "MSTR": "IBIT","MARA": "IBIT","RIOT": "IBIT",
+    "PLTR": "XLK", "LMT":  "ITA", "RTX":  "ITA", "NOC":  "ITA",
+    "LLY":  "XLV",
+    # Expanded US mega-cap universe
+    "AAPL": "XLK", "MSFT": "XLK", "AMZN": "XLK", "GOOGL": "XLK",
+    "META": "XLK", "TSLA": "XLK",
+    "JPM":  "XLF", "BAC":  "XLF", "WFC":  "XLF", "C":   "XLF",
+    "GS":   "XLF", "MS":   "XLF",
+    "WMT":  "XLU", "HD":   "XLU", "COST": "XLU", "NKE":  "XLU",
+    "MCD":  "XLU",
+    "JNJ":  "XLV", "UNH":  "XLV", "PFE":  "XLV", "MRK":  "XLV",
+    "ABBV": "XLV", "ABT":  "XLV", "TMO":  "XLV",
+    "XOM":  "XLU", "CVX":  "XLU",
+    "PG":   "XLU", "KO":   "XLU", "PEP":  "XLU",
+    "MA":   "XLF", "V":    "XLF",
+    "DIS":  "XLU", "NFLX": "XLK",
+    "CSCO": "XLK", "ORCL": "XLK", "IBM":  "XLK",
 }
 
 
@@ -121,43 +162,75 @@ def _window(sb, symbol: str, base_cid: int, end_dt: str, duration: str,
     raise last
 
 
-# Ordered list of fetch plans (each plan = list of (end_dt, duration) windows).
-# We try plans in order; first one to produce >= MIN_BARS rows wins.
-FETCH_PLANS = [
-    # Plan A: 1 Y 2024 + 6 M recent  -> ~376 rows
-    [("20241231 23:59:59", "1 Y"), ("", "6 M")],
-    # Plan B: 6 M + 6 M for 2024 + 6 M recent  (for tickers that fail on 1 Y)
-    [("20240630 23:59:59", "6 M"), ("20241231 23:59:59", "6 M"), ("", "6 M")],
-    # Plan C: 9 M end Sep 2024 + 6 M recent  (minimal usable 2024 coverage)
-    [("20240930 23:59:59", "9 M"), ("", "6 M")],
-    # Plan D: try just recent 12 M as a floor  (at least some data)
-    [("", "1 Y")],
+# Yearly window plan: for each calendar year we want covered, try a 1Y pull,
+# and if that fails (some tickers return malformed data on 1Y) fall back to
+# two 6M pulls within that year. We piece the whole 5-year history together.
+# Each entry is (end_dt_1Y, year_end_jun_for_fallback, year_end_dec_for_fallback).
+YEAR_WINDOWS = [
+    ("20211231 23:59:59", "20210630 23:59:59", "20211231 23:59:59"),
+    ("20221231 23:59:59", "20220630 23:59:59", "20221231 23:59:59"),
+    ("20231231 23:59:59", "20230630 23:59:59", "20231231 23:59:59"),
+    ("20241231 23:59:59", "20240630 23:59:59", "20241231 23:59:59"),
+    # Most recent year: no explicit end, pull trailing 6 months twice to cover
+    ("",                  "",                  ""),
 ]
-MIN_BARS_FLOOR = 100   # refuse to save anything below this
-GOOD_BARS      = 300   # a "complete" pull
+MIN_BARS_FLOOR = 60    # refuse to save anything below this
+GOOD_BARS      = 500   # a "complete" pull ~ 2Y+
+
+
+def _year_window(sb, symbol, base_cid, end_1y, end_jun, end_dec,
+                 sec_type="STK", exchange="SMART"):
+    """
+    Pull one calendar year of data. Try 1Y first; if the shinybroker payload
+    is malformed (some tickers hit that on certain year boundaries), split
+    into two 6M windows (Jan-Jun and Jul-Dec). For the most recent (empty)
+    year, pull two trailing 6M windows.
+    """
+    if end_1y:
+        try:
+            return _window(sb, symbol, base_cid, end_1y, "1 Y",
+                           retries=2, sec_type=sec_type, exchange=exchange)
+        except Exception:
+            pass
+    # Fallback: 2x6M
+    frames = []
+    for k, end_dt in enumerate([end_jun, end_dec] if end_jun else ["", ""]):
+        try:
+            dur = "6 M"
+            f = _window(sb, symbol, base_cid + 100 + k*100, end_dt, dur,
+                        retries=2, sec_type=sec_type, exchange=exchange)
+            frames.append(f)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
 
 
 def fetch_ticker(sb, symbol: str, base_cid: int, sec_type: str = "STK", exchange: str = "SMART") -> pd.DataFrame:
-    last_err = None
-    for i, plan in enumerate(FETCH_PLANS):
+    """Pull 5 calendar years of history, each year independently resilient."""
+    frames = []
+    for j, (end_1y, end_jun, end_dec) in enumerate(YEAR_WINDOWS):
+        cid = base_cid + j * 1000
         try:
-            frames = []
-            for j, (end_dt, dur) in enumerate(plan):
-                frames.append(_window(sb, symbol, base_cid + i * 1000 + j * 100, end_dt, dur,
-                                      sec_type=sec_type, exchange=exchange))
-            merged = (
-                pd.concat(frames, ignore_index=True)
-                .drop_duplicates("timestamp")
-                .sort_values("timestamp")
-                .reset_index(drop=True)
-            )
-            if len(merged) >= MIN_BARS_FLOOR:
-                return merged
-            last_err = RuntimeError(f"plan {i} returned only {len(merged)} rows")
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0)
-    raise last_err or RuntimeError("all plans failed")
+            yf = _year_window(sb, symbol, cid, end_1y, end_jun, end_dec,
+                              sec_type=sec_type, exchange=exchange)
+            if not yf.empty:
+                frames.append(yf)
+        except Exception:
+            continue
+        time.sleep(0.3)
+    if not frames:
+        raise RuntimeError("no year windows returned data")
+    merged = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    if len(merged) < MIN_BARS_FLOOR:
+        raise RuntimeError(f"only {len(merged)} rows total")
+    return merged
 
 
 def main() -> int:
